@@ -20,10 +20,7 @@ jobs:
       - name: Checkout repository
         run: |
           apk add --no-cache git
-          git config --global --add safe.directory /__w/rustnet/rustnet
           git clone --depth 1 https://github.com/${{ github.repository }}.git .
-          git fetch --depth 1 origin tag "${{ inputs.version }}"
-          git checkout "${{ inputs.version }}"
 
       - name: Install dependencies
         run: |
