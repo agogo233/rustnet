@@ -31,14 +31,15 @@ RustNet 处理不受信任的网络数据，因此纵深防御至关重要。本
 | 文件系统 | 5.13+ | 仅 `/proc` 可读（用于进程识别） |
 | 网络 | 6.4+ | 禁止 TCP bind/connect（RustNet 为被动模式） |
 | Linux capabilities | 任意 | pcap socket 打开后丢弃 `CAP_NET_RAW` |
-| Linux capabilities | 任意 | eBPF 程序加载后丢弃 `CAP_BPF`、`CAP_PERFMON` |
-| 特权 | 任意 | `PR_SET_NO_NEW_PRIVS` 防止通过 setuid 二进制文件提升特权 |
+| Linux capabilities | 任意 | eBPF 程序加载后丢弃 `CAP_BPF`、`CAP_PERFMON`、`CAP_SYS_ADMIN` |
+| 特权 | 3.5+ | `PR_SET_NO_NEW_PRIVS` 由 RustNet 自身设置——始终生效，即使使用 `--no-sandbox`——防止通过 setuid 二进制文件提升特权 |
 
 ### 工作原理
 
 1. **初始化阶段**：RustNet 加载 eBPF 程序、打开包捕获句柄、创建日志文件
-2. **Linux capabilities 剥离**：移除 `CAP_NET_RAW`、`CAP_BPF` 和 `CAP_PERFMON`
-3. **Landlock**：限制文件系统和网络访问
+2. **特权锁定**：设置 `PR_SET_NO_NEW_PRIVS`（即使禁用沙箱也会应用）
+3. **Linux capabilities 剥离**：移除 `CAP_NET_RAW`、`CAP_BPF`、`CAP_PERFMON` 和 `CAP_SYS_ADMIN`
+4. **Landlock**：限制文件系统和网络访问
 
 ### 安全收益
 
@@ -48,12 +49,13 @@ RustNet 处理不受信任的网络数据，因此纵深防御至关重要。本
 - 无法建立出站 TCP 连接（阻止数据外泄）
 - 无法绑定 TCP 端口（阻止反向 shell）
 - 无法创建新的 raw socket（Linux capabilities 已剥离）
-- 无法通过 setuid 二进制文件提升特权（`PR_SET_NO_NEW_PRIVS`）
+- 无法通过 setuid 二进制文件提升特权（`PR_SET_NO_NEW_PRIVS`，即使使用 `--no-sandbox` 也会设置）
 
 ### CLI 选项
 
 ```
 --no-sandbox        禁用 Landlock 沙箱和 Linux capabilities 剥离
+                    （仍会设置 PR_SET_NO_NEW_PRIVS）
 --sandbox-strict    要求完整沙箱强制生效，否则退出
 ```
 
@@ -189,14 +191,14 @@ RustNet 需要特权访问来捕获网络数据包：
 # 现代 Linux（5.8+）：包捕获 + eBPF
 sudo setcap 'cap_net_raw,cap_bpf,cap_perfmon+eip' $(which rustnet)
 
-# 旧版 Linux（pre-5.8）：包捕获 + eBPF
-sudo setcap 'cap_net_raw,cap_sys_admin+eip' $(which rustnet)
-
-# 仅包捕获（无 eBPF 进程检测）
+# 仅包捕获（eBPF 会回退到 procfs）
 sudo setcap cap_net_raw+eip $(which rustnet)
 ```
 
-沙箱应用后，`CAP_NET_RAW` 会被丢弃——进程仅保留所需的最小特权。
+旧版 pre-5.8 内核需要宽泛的 `CAP_SYS_ADMIN` 才能执行 eBPF 操作。RustNet
+的安装包不会自动授予该 capability；除非你明确接受该风险，否则请只授予
+`CAP_NET_RAW` 并使用 procfs 回退。沙箱应用后，`CAP_NET_RAW` 和 eBPF
+加载相关 capabilities 会被丢弃——进程仅保留所需的最小特权。
 
 ## 只读操作<a id="read-only-operation"></a>
 
@@ -235,7 +237,7 @@ RustNet 完全在本地运行：
 
 使用 eBPF 进行增强型进程检测时（Linux 默认）：
 
-- 需要额外的 Linux capabilities（`CAP_BPF`、`CAP_PERFMON`）
+- 现代内核需要额外的 Linux capabilities（`CAP_BPF`、`CAP_PERFMON`）
 - eBPF 程序在加载前由内核验证
 - 仅限只读操作（不修改数据包）
 - 如果 eBPF 失败，自动回退到 procfs
@@ -255,10 +257,10 @@ RustNet 完全在本地运行：
 
 ### 以 Root 身份运行时的沙箱
 
-Landlock（Linux）和 Seatbelt（macOS）即使在 RustNet 以 root（UID 0）运行时也会强制执行限制。沙箱一旦应用就无法从进程内部撤销——Landlock 设置了 `PR_SET_NO_NEW_PRIVS`，每个进程该设置不可逆。
+Landlock（Linux）和 Seatbelt（macOS）即使在 RustNet 以 root（UID 0）运行时也会强制执行限制。沙箱一旦应用就无法从进程内部撤销——在 Linux 上，RustNet 会在应用任何限制之前直接设置 `PR_SET_NO_NEW_PRIVS`（Landlock 也需要并会同样设置它），该设置对每个进程不可逆，并且即使使用 `--no-sandbox` 也会应用。
 
 然而，沙箱**不能**防护供应链攻击。被入侵的二进制文件可以直接不应用沙箱。Root 也可以：
-- 传递 `--no-sandbox` 完全跳过沙箱
+- 传递 `--no-sandbox` 完全跳过沙箱（`PR_SET_NO_NEW_PRIVS` 除外）
 - 卸载 Landlock LSM 内核模块
 - 在 macOS 上禁用 SIP（控制沙箱强制执行）
 - 使用 `ptrace` 修改运行中的进程
@@ -270,7 +272,7 @@ Landlock（Linux）和 Seatbelt（macOS）即使在 RustNet 以 root（UID 0）�
 RustNet 采取以下措施防护供应链攻击：
 
 - **依赖锁文件**：`Cargo.lock` 已提交到仓库，固定所有传递依赖版本并记录源校验和。这防止静默版本升级。
-- **安全审计**：`cargo audit` 在每次 push 和 pull request 时于 CI 中运行，对照 RustSec Advisory Database 检查依赖。
+- **安全审计**：`cargo deny check` 在每次 push 和 pull request 时于 CI 中运行，对照 RustSec Advisory Database 检查依赖，并强制执行许可证、来源和通配符版本策略（`deny.toml`）。一个每日定时工作流会针对已提交的 `Cargo.lock` 重新检查安全公告，因此新发布的公告无需 push 即可被发现。
 - **CI action 固定**：所有 GitHub Actions 均通过 commit SHA（而非标签）固定，防止对上游 action 的标签重写攻击。
 - **保守的依赖策略**：新依赖需要说明理由，并审查其维护状态和安全记录（参见 [CONTRIBUTING.zh-CN.md](CONTRIBUTING.zh-CN.md)）。
 - **构建时完整性**：Windows Npcap SDK 下载在 `build.rs` 中对照硬编码的 SHA256 校验和进行验证。

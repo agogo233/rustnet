@@ -96,6 +96,14 @@ fn main() -> Result<()> {
         ui::set_no_color(true);
     }
 
+    // Color theme preset
+    let theme_preset = match matches.get_one::<String>("theme").map(String::as_str) {
+        Some("classic") => ui::ThemePreset::Classic,
+        _ => ui::ThemePreset::Muted,
+    };
+    info!("Using {theme_preset:?} color theme");
+    ui::set_theme_preset(theme_preset);
+
     // GeoIP configuration
     if matches.get_flag("no-geoip") {
         config.disable_geoip = true;
@@ -117,6 +125,31 @@ fn main() -> Result<()> {
         info!("Using GeoIP City database: {}", city_path);
     }
 
+    // Pre-create the PCAP export file and its sidecar JSONL (needed for Landlock
+    // permissions). This must be done BEFORE the sandbox is applied so the files
+    // exist when adding rules: Landlock requires an open FD to scope a rule to a
+    // file, so a not-yet-existing path falls back to granting write on the whole
+    // parent directory. Pre-creating keeps the write rule file-scoped. The PCAP
+    // writer later reopens the path with truncation, so a zero-byte file is fine.
+    //
+    // Done before terminal setup: pre-creation can fail hard (see below), and we
+    // want the error to print to a normal terminal rather than into the TUI
+    // alt-screen (which would also leave the terminal in raw mode).
+    if let Some(ref pcap_path) = config.pcap_export_file {
+        let jsonl_path = format!("{}.connections.jsonl", pcap_path);
+        for (label, path) in [("PCAP", pcap_path.as_str()), ("sidecar JSONL", &jsonl_path)] {
+            // Fail hard rather than continue: if we can't safely create the file
+            // (e.g. the path is a symlink, rejected by O_NOFOLLOW), aborting now
+            // is the only way the protection is meaningful. The PCAP itself is
+            // later written by libpcap's pcap_dump_open, which does NOT honor
+            // O_NOFOLLOW, so a warn-and-continue here would let libpcap follow an
+            // attacker-controlled symlink and write the capture there anyway.
+            precreate_private_file(path).map_err(|e| {
+                anyhow::anyhow!("Failed to pre-create {} file '{}': {}", label, path, e)
+            })?;
+        }
+    }
+
     // Set up terminal
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = ui::setup_terminal(backend)?;
@@ -126,32 +159,6 @@ fn main() -> Result<()> {
     let mut app = app::App::new(config.clone())?;
     let process_ready_rx = app.start()?;
     info!("Application started");
-
-    // Pre-create the PCAP export file and its sidecar JSONL (needed for Landlock
-    // permissions). This must be done BEFORE the sandbox is applied so the files
-    // exist when adding rules: Landlock requires an open FD to scope a rule to a
-    // file, so a not-yet-existing path falls back to granting write on the whole
-    // parent directory. Pre-creating keeps the write rule file-scoped. The PCAP
-    // writer later reopens the path with truncation, so a zero-byte file is fine.
-    if let Some(ref pcap_path) = config.pcap_export_file {
-        let jsonl_path = format!("{}.connections.jsonl", pcap_path);
-        for (label, path) in [("PCAP", pcap_path.as_str()), ("sidecar JSONL", &jsonl_path)] {
-            match std::fs::File::create(path) {
-                Ok(_f) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = _f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-                            warn!("Failed to set {} file permissions: {}", label, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to pre-create {} file: {}", label, e);
-                }
-            }
-        }
-    }
 
     // Wait for process detection (including eBPF loading) to complete before
     // applying the sandbox, which drops CAP_BPF and CAP_PERFMON.
@@ -172,7 +179,7 @@ fn main() -> Result<()> {
     // - eBPF programs need to be loaded first (requires CAP_BPF + CAP_PERFMON)
     // - Packet capture handles need to be opened first (access to /dev)
     // - Log files need to be created first
-    #[cfg(all(target_os = "linux", feature = "landlock"))]
+    #[cfg(target_os = "linux")]
     {
         use network::geoip::GeoIpResolver;
         use network::platform::sandbox::{
@@ -241,6 +248,7 @@ fn main() -> Result<()> {
                     net_restricted: result.landlock_net_applied,
                     scope_restricted: result.landlock_scope_applied,
                     landlock_abi: result.landlock_effective_abi,
+                    no_new_privs: result.no_new_privs,
                 });
             }
             Err(e) => {
@@ -257,6 +265,7 @@ fn main() -> Result<()> {
                     net_restricted: false,
                     scope_restricted: false,
                     landlock_abi: None,
+                    no_new_privs: false,
                 });
             }
         }
@@ -516,6 +525,26 @@ fn setup_logging(level: LevelFilter) -> Result<()> {
     Ok(())
 }
 
+fn precreate_private_file(path: &str) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
 /// Sort connections based on the specified column and direction
 use ui::{clear_all_with_confirmation, copy_to_clipboard, sort_connections};
 
@@ -540,12 +569,24 @@ where
     let mut stats = app.get_stats();
     let mut needs_data_refresh = true;
     let mut needs_regroup = false;
+    let mut last_seen_generation = u64::MAX; // force the first refresh
 
     loop {
         // Refresh connection data only when needed:
-        // - On timer tick (every 200ms) for live updates
+        // - On timer tick (every 200ms), but only if the snapshot actually
+        //   changed since we last consumed it (it rebuilds every
+        //   refresh-interval ms, so most ticks would re-clone and re-sort
+        //   identical data)
         // - When an event changes filter, sort, or data source
-        if needs_data_refresh || last_tick.elapsed() >= tick_rate {
+        let tick_elapsed = last_tick.elapsed() >= tick_rate;
+        let snapshot_generation = app.snapshot_generation();
+        if tick_elapsed {
+            // Keep counters (packets processed/dropped, etc.) live on every
+            // tick even when the connection list is unchanged.
+            stats = app.get_stats();
+            last_tick = std::time::Instant::now();
+        }
+        if needs_data_refresh || (tick_elapsed && snapshot_generation != last_seen_generation) {
             connections = if ui_state.filter_query.is_empty() && !ui_state.filter_mode {
                 app.get_connections()
             } else {
@@ -561,8 +602,7 @@ where
             } else {
                 Vec::new()
             };
-            stats = app.get_stats();
-            last_tick = std::time::Instant::now();
+            last_seen_generation = snapshot_generation;
             needs_data_refresh = false;
             needs_regroup = false;
         } else if needs_regroup {
@@ -619,12 +659,15 @@ where
             }
         })?;
 
-        // Update visible rows for page navigation based on terminal height
+        // Update visible rows for page navigation based on terminal height.
+        // Chrome rows: tab bar (2) + section title (1) + table header incl.
+        // margin (2) + status bar (1) = 6, plus the filter line (1) when a
+        // filter is being edited or active.
         if let Ok(size) = terminal.size() {
             let chrome = if ui_state.filter_mode || !ui_state.filter_query.is_empty() {
-                11
+                7
             } else {
-                8
+                6
             };
             ui_state.visible_rows = (size.height as usize).saturating_sub(chrome);
         }
@@ -725,6 +768,26 @@ where
                                                 ui_state.selected_tab = 1;
                                             }
                                         }
+                                    }
+                                    ui::ClickAction::SelectConnectionKey(key) => {
+                                        // Keep the grouped selection coherent: adopt the
+                                        // clicked connection's group when grouping is on.
+                                        if ui_state.grouping_enabled {
+                                            for row in &grouped_rows {
+                                                if let ui::GroupedRow::Connection {
+                                                    process_name,
+                                                    connection,
+                                                    ..
+                                                } = row
+                                                    && connection.key() == key
+                                                {
+                                                    ui_state.selected_group =
+                                                        Some(process_name.clone());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        ui_state.selected_connection_key = Some(key);
                                     }
                                     ui::ClickAction::CopyField { label, value } => {
                                         copy_to_clipboard(

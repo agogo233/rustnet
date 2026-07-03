@@ -52,9 +52,9 @@ Before submitting a PR, please ensure:
   ```bash
   cargo fmt
   ```
-- **Security audit**: Check for known vulnerabilities in dependencies
+- **Security audit**: Check for known vulnerabilities and policy violations in dependencies
   ```bash
-  cargo audit
+  cargo deny check
   ```
 
 ## CI Checks
@@ -93,6 +93,7 @@ Security is important for a network monitoring tool:
 - Keep PRs focused - one feature or fix per PR
 - Be responsive to review feedback
 - Verify locally before opening the PR. The PR template lists the exact commands.
+- Add user-visible changes to the `## [Unreleased]` section of `CHANGELOG.md` in the same PR
 
 ## Duplicate Pull Requests
 

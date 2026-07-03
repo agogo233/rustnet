@@ -2,6 +2,14 @@
 
 This document is for maintainers releasing new versions of RustNet.
 
+## Changelog Maintenance (ongoing, not at release time)
+
+Notable changes are added to the `## [Unreleased]` section of `CHANGELOG.md` in
+the same PR that makes them — don't wait until release time and reconstruct the
+list from git history. Cutting a release then just renames that section (see
+step 3 below). `pre-release-check.sh` warns if `[Unreleased]` still has content
+after the rename, and the release workflow's notes extraction ignores it.
+
 ## Creating a New Release
 
 ### 1. Run Pre-Release Checks
@@ -34,12 +42,29 @@ This catches cross-platform and static linking issues before you invest time in 
 
 ### 3. Prepare the Release
 
-Update version in `Cargo.toml`, `rpm/rustnet.spec`, and update `CHANGELOG.md` with release notes:
+> **Two version tracks since the workspace split.** `Cargo.toml` carries two
+> versions: the binary's `[package] version` (line ~30, the user-facing `1.x`
+> line that tags and packages follow) and `[workspace.package] version` (line
+> ~9, the `0.x` library crates `rustnet-core`/`-capture`/`-host`, single source
+> of truth also referenced from `[workspace.dependencies]`). A normal feature
+> release bumps **only the binary `[package] version`** and `rpm/rustnet.spec`.
+> Bump the library version separately, and only when the libraries actually
+> change in a release-worthy way.
+
+Update the binary version in `Cargo.toml` and `rpm/rustnet.spec`, and turn the
+accumulated `[Unreleased]` changelog section into the release entry:
 
 ```bash
-# Update Cargo.toml version (e.g., version = "0.3.0")
-# Update rpm/rustnet.spec Version field (e.g., Version: 0.3.0)
-# Update CHANGELOG.md with new version section
+# Update Cargo.toml [package] version (e.g., version = "1.4.0") — NOT the
+#   [workspace.package] version unless you intend to bump the library crates.
+# Update rpm/rustnet.spec Version field (e.g., Version: 1.4.0)
+
+# In CHANGELOG.md:
+#   1. Rename "## [Unreleased]" to "## [0.3.0] - YYYY-MM-DD" (review/polish the entries)
+#   2. Add a fresh, empty "## [Unreleased]" section above it
+#   3. Update the comparison links at the bottom:
+#        [Unreleased]: https://github.com/domcyrus/rustnet/compare/v0.3.0...HEAD
+#        [0.3.0]: https://github.com/domcyrus/rustnet/compare/v0.2.0...v0.3.0
 
 # Update Cargo.lock and test the build
 cargo build --release
@@ -119,6 +144,16 @@ The release process is fully automated via [`.github/workflows/release.yml`](.gi
    - Attaches all binaries and installer packages
    - Uses extracted changelog content as release notes
 
+5. **Publishes the workspace to crates.io** (via
+   [`.github/workflows/publish.yml`](.github/workflows/publish.yml), after the
+   GitHub release is published): the four crates are published in dependency
+   order — `rustnet-core` → `rustnet-capture` → `rustnet-host` →
+   `rustnet-monitor` — waiting for each to appear in the index before publishing
+   a dependent. The step is idempotent (it skips any `crate@version` already on
+   crates.io), so a re-run after a partial failure is safe. The library crates
+   use the `[workspace.package]` version; the binary uses its `[package]`
+   version.
+
 ## Important: Never Move a Tag After Release
 
 **Never force-push or move a tag after the release pipeline has started.** Moving a tag
@@ -137,10 +172,10 @@ Before pushing the tag, ensure:
 
 - [ ] Pre-release checks pass: `./scripts/pre-release-check.sh x.y.z`
 - [ ] Test Platform Builds workflow passes for all platforms (including static)
-- [ ] Version number updated in `Cargo.toml`
+- [ ] Binary version updated in `Cargo.toml` `[package]` (not `[workspace.package]` unless bumping the library crates)
 - [ ] Version number updated in `rpm/rustnet.spec` (line 5: `Version: x.y.z`)
 - [ ] `Cargo.lock` updated (via `cargo build`)
-- [ ] `CHANGELOG.md` updated with release notes in format `## [x.y.z] - YYYY-MM-DD`
+- [ ] `CHANGELOG.md`: `[Unreleased]` renamed to `## [x.y.z] - YYYY-MM-DD`, a fresh empty `[Unreleased]` added, comparison links updated
 - [ ] All tests pass (`cargo test`)
 - [ ] Changes committed to main branch
 - [ ] Git tag created and pushed
@@ -151,6 +186,7 @@ After GitHub Actions completes:
 - [ ] Verify all platform binaries built successfully
 - [ ] Verify all installer packages created (DEB, RPM, DMG, MSI)
 - [ ] Verify Docker image pushed to ghcr.io
+- [ ] Verify all four crates published to crates.io (`rustnet-monitor`, `rustnet-core`, `rustnet-capture`, `rustnet-host`) and docs.rs built
 - [ ] Review automatically extracted release notes
 - [ ] Verify Homebrew formula updated at https://github.com/domcyrus/homebrew-rustnet
 - [ ] Verify Chocolatey package updated at https://github.com/domcyrus/rustnet-chocolatey

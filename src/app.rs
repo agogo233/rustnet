@@ -78,6 +78,9 @@ pub struct SandboxInfo {
     /// Effective Landlock ABI negotiated with the kernel (e.g. `Some(6)`), or `None`
     #[cfg(target_os = "linux")]
     pub landlock_abi: Option<u8>,
+    /// Whether PR_SET_NO_NEW_PRIVS is set (applied even with `--no-sandbox`)
+    #[cfg(target_os = "linux")]
+    pub no_new_privs: bool,
     // macOS-specific fields (Seatbelt)
     /// Whether Seatbelt sandbox was applied
     #[cfg(all(target_os = "macos", feature = "macos-sandbox"))]
@@ -146,15 +149,66 @@ const MAX_PACKET_QUEUE: usize = 10_000;
 
 /// Open or create a file for appending with restrictive permissions (0o600 on Unix).
 ///
-/// Ensures log files containing connection metadata are not world-readable.
+/// Ensures log files containing connection metadata are not world-readable, and
+/// refuses to follow symlinks (`O_NOFOLLOW`) so a planted symlink can't redirect
+/// the privileged write elsewhere.
+///
+/// On failure this surfaces a single warning (rather than aborting the running
+/// monitor): the callers run in the per-event hot path, so silently dropping the
+/// error — as the previous `if let Ok(..)` did — would disable connection logging
+/// with no indication. We warn once to avoid per-event log spam.
 fn open_log_file(path: &str) -> std::io::Result<File> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    let result = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(path)
+        }
+
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new().create(true).append(true).open(path)
+        }
+    };
+
+    if let Err(ref e) = result {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            // The log file is opened with O_NOFOLLOW, so a symlinked path is
+            // refused. Depending on privilege and `fs.protected_symlinks`, that
+            // surfaces as ELOOP (raw O_NOFOLLOW) or EACCES (kernel symlink
+            // protection denies first), so we mention symlinks for both rather
+            // than keying on a single errno.
+            #[cfg(unix)]
+            let symlink_hint = matches!(
+                e.raw_os_error(),
+                Some(code) if code == libc::ELOOP || code == libc::EACCES
+            );
+            #[cfg(not(unix))]
+            let symlink_hint = false;
+
+            if symlink_hint {
+                warn!(
+                    "Refusing to write log to '{}': {} (path may be a symlink; \
+                     symlinks are rejected via O_NOFOLLOW). Connection logging is disabled.",
+                    path, e
+                );
+            } else {
+                warn!(
+                    "Failed to open log file '{}': {}. Connection logging is disabled.",
+                    path, e
+                );
+            }
+        }
     }
-    Ok(file)
+
+    result
 }
 
 /// Helper function to log connection events as JSON
@@ -421,6 +475,12 @@ pub struct App {
     /// Current connections snapshot for UI
     connections_snapshot: Arc<RwLock<Vec<Connection>>>,
 
+    /// Bumped by the snapshot thread after each snapshot write. Lets the UI
+    /// loop skip re-cloning and re-sorting an unchanged snapshot (the
+    /// snapshot refreshes every `refresh_interval` ms, the UI ticks every
+    /// 200ms — without this, most ticks redo identical work).
+    snapshot_generation: Arc<AtomicU64>,
+
     /// Whether to include historic connections in the snapshot
     show_historic: Arc<AtomicBool>,
 
@@ -558,6 +618,7 @@ impl App {
             should_stop: Arc::new(AtomicBool::new(false)),
             tracker: Arc::new(ConnectionTracker::new()),
             connections_snapshot: Arc::new(RwLock::new(Vec::new())),
+            snapshot_generation: Arc::new(AtomicU64::new(0)),
             show_historic: Arc::new(AtomicBool::new(false)),
             service_lookup: Arc::new(service_lookup),
             oui_lookup,
@@ -1031,6 +1092,11 @@ impl App {
                     // packet that panics a DPI parser cannot take down the
                     // whole pcap_rx thread and leave the monitor running
                     // blind.
+                    // One wall-clock read per batch instead of per packet.
+                    // Batches hold ≤100 packets and flush at least every
+                    // 100ms, so the timestamp skew is far below any
+                    // connection timeout or rate window.
+                    let batch_time = SystemTime::now();
                     let mut parsed_count = 0;
                     for packet_data in &batch {
                         let parse_result =
@@ -1042,6 +1108,7 @@ impl App {
                                 update_connection(
                                     &tracker,
                                     parsed,
+                                    batch_time,
                                     &stats,
                                     &json_log_path,
                                     dns_resolver.as_deref(),
@@ -1173,7 +1240,20 @@ impl App {
         // Signal that process detection (including eBPF loading) is complete.
         // The main thread waits for this before dropping eBPF capabilities.
         let _ = process_ready_tx.send(());
-        let interval = Duration::from_secs(2); // Use default interval
+
+        // Fast/slow enrichment cadence. Young connections are retried on a
+        // quick tick so their process name appears almost immediately (the
+        // eBPF map entry exists from the moment the socket connects — a
+        // slower cadence only buys a visible "-" in the UI). Older
+        // stragglers (e.g. NAT-translated container traffic the lookup can
+        // never resolve) are retried only on the full pass so the fast
+        // tick stays cheap, and fully attributed connections are skipped
+        // entirely.
+        let tick = Duration::from_millis(250);
+        let full_pass_interval = Duration::from_secs(2);
+        // Connections younger than this are retried on every fast tick.
+        const YOUNG_CONNECTION_SECS: u64 = 10;
+        let mut last_full_pass = Instant::now() - full_pass_interval;
 
         // Build and set the detection status from the process lookup implementation
         // Only set if not already detected as pktap (to handle race conditions)
@@ -1223,30 +1303,36 @@ impl App {
                 last_refresh = Instant::now();
             }
 
+            let full_pass = last_full_pass.elapsed() >= full_pass_interval;
+            if full_pass {
+                last_full_pass = Instant::now();
+            }
+
             // Enrich connections without process info
             let mut enriched = 0;
             for mut entry in tracker.connections().iter_mut() {
+                // Fully attributed — nothing to do (names are permanent).
+                if entry.process_name.is_some() && entry.pid.is_some() {
+                    continue;
+                }
+                // Fast ticks only retry young connections; older ones wait
+                // for the full pass.
+                if !full_pass {
+                    let young = entry
+                        .created_at
+                        .elapsed()
+                        .map(|age| age.as_secs() < YOUNG_CONNECTION_SECS)
+                        .unwrap_or(true);
+                    if !young {
+                        continue;
+                    }
+                }
+
                 // Allow partial enrichment - fill in missing pieces without overwriting existing data
                 if let Some((pid, name)) = process_lookup.get_process_for_connection(&entry) {
                     let mut did_enrich = false;
 
-                    // Only set process name if it's missing
-                    if let Some(existing_name) = &entry.process_name {
-                        // Check if the existing name differs significantly (for debugging)
-                        let existing_normalized = existing_name
-                            .split_whitespace()
-                            .collect::<Vec<&str>>()
-                            .join(" ");
-                        let new_normalized =
-                            name.split_whitespace().collect::<Vec<&str>>().join(" ");
-
-                        if existing_normalized != new_normalized {
-                            debug!(
-                                "⚠️  Process name differs: existing='{}' vs lsof='{}'",
-                                existing_name, name
-                            );
-                        }
-                    } else {
+                    if entry.process_name.is_none() {
                         entry.process_name = Some(name.clone());
                         did_enrich = true;
                         debug!(
@@ -1255,20 +1341,10 @@ impl App {
                             name
                         );
                     }
-
-                    // Only set PID if it's missing
                     if entry.pid.is_none() {
                         entry.pid = Some(pid);
                         did_enrich = true;
                         debug!("✓ Set PID for connection {}: {}", entry.key(), pid);
-                    } else if entry.pid != Some(pid) {
-                        // PID differs - log for debugging
-                        debug!(
-                            "⚠️  PID differs for {}: existing={:?} vs lsof={}",
-                            entry.key(),
-                            entry.pid,
-                            pid
-                        );
                     }
 
                     if did_enrich {
@@ -1281,7 +1357,7 @@ impl App {
                 debug!("Enriched {} connections with process info", enriched);
             }
 
-            thread::sleep(interval);
+            thread::sleep(tick);
         }
 
         Ok(())
@@ -1290,6 +1366,7 @@ impl App {
     /// Start snapshot provider thread for UI updates
     fn start_snapshot_provider(&self, tracker: Arc<ConnectionTracker>) -> Result<()> {
         let snapshot = Arc::clone(&self.connections_snapshot);
+        let snapshot_generation = Arc::clone(&self.snapshot_generation);
         let should_stop = Arc::clone(&self.should_stop);
         let stats = Arc::clone(&self.stats);
         let service_lookup = Arc::clone(&self.service_lookup);
@@ -1341,7 +1418,10 @@ impl App {
                         .connections()
                         .iter()
                         .filter_map(|entry| {
-                            let mut conn = entry.value().clone();
+                            // snapshot_clone: leave the live tracker as unique
+                            // owner of its rate samples, otherwise the next
+                            // per-packet update pays an Arc::make_mut deep copy.
+                            let mut conn = entry.value().snapshot_clone();
                             if enrich_and_filter(&mut conn, &service_lookup, filter_localhost)
                                 && conn.is_active()
                             {
@@ -1358,7 +1438,7 @@ impl App {
                             .historic()
                             .iter()
                             .filter_map(|entry| {
-                                let mut conn = entry.value().clone();
+                                let mut conn = entry.value().snapshot_clone();
                                 if enrich_and_filter(&mut conn, &service_lookup, filter_localhost) {
                                     Some(conn)
                                 } else {
@@ -1374,8 +1454,10 @@ impl App {
 
                     let filtered_count = snapshot_data.len();
 
-                    // Update snapshot
+                    // Update snapshot and publish the new generation so the
+                    // UI loop knows there is fresh data to re-sort.
                     *snapshot.write().unwrap() = snapshot_data;
+                    snapshot_generation.fetch_add(1, Ordering::Release);
 
                     // Update stats (only count active connections)
                     stats
@@ -1415,13 +1497,21 @@ impl App {
 
                     // Refresh rates for connections that may still have non-zero rates.
                     // Skip connections idle >30s whose rates are already zero.
+                    let sweep_start = Instant::now();
+                    let mut refreshed = 0usize;
                     for mut entry in tracker.connections().iter_mut() {
                         let conn = entry.value_mut();
                         let idle_secs = conn.last_activity.elapsed().unwrap_or_default().as_secs();
                         if idle_secs <= 30 || conn.has_nonzero_rates() {
                             conn.refresh_rates();
+                            refreshed += 1;
                         }
                     }
+                    debug!(
+                        "State refresh sweep took {:?} for {} refreshed connections",
+                        sweep_start.elapsed(),
+                        refreshed
+                    );
 
                     // Run every 1 second to balance responsiveness with performance
                     thread::sleep(Duration::from_secs(1));
@@ -1700,39 +1790,40 @@ impl App {
         self.get_filtered_connections("")
     }
 
+    /// Generation of the current snapshot; bumped on every snapshot rebuild.
+    /// The UI loop compares this against the last generation it consumed to
+    /// skip re-cloning and re-sorting unchanged data.
+    pub fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation.load(Ordering::Acquire)
+    }
+
     /// Get filtered connections for UI display
     pub fn get_filtered_connections(&self, filter_query: &str) -> Vec<Connection> {
-        let connections = self.connections_snapshot.read().unwrap().clone();
-
         // Filter out DNS PTR queries/responses when reverse DNS is enabled
         let hide_ptr_lookups = self.dns_resolver.is_some() && !self.config.show_ptr_lookups;
-
-        let connections: Vec<Connection> = if hide_ptr_lookups {
-            connections
-                .into_iter()
-                .filter(|conn| {
-                    // Hide DNS PTR queries/responses (used for reverse DNS lookups)
-                    if let Some(ref dpi) = conn.dpi_info
-                        && let ApplicationProtocol::Dns(ref dns_info) = dpi.application
-                        && dns_info.query_type == Some(DnsQueryType::PTR)
-                    {
-                        return false;
-                    }
-                    true
-                })
-                .collect()
+        let filter = if filter_query.trim().is_empty() {
+            None
         } else {
-            connections
+            Some(ConnectionFilter::parse(filter_query))
         };
 
-        if filter_query.trim().is_empty() {
-            return connections;
-        }
-
-        let filter = ConnectionFilter::parse(filter_query);
-        connections
-            .into_iter()
-            .filter(|conn| filter.matches(conn))
+        // Filter by reference under the read guard and clone only the
+        // matches, instead of cloning the whole snapshot first.
+        let snapshot = self.connections_snapshot.read().unwrap();
+        snapshot
+            .iter()
+            .filter(|conn| {
+                // Hide DNS PTR queries/responses (used for reverse DNS lookups)
+                if hide_ptr_lookups
+                    && let Some(ref dpi) = conn.dpi_info
+                    && let ApplicationProtocol::Dns(ref dns_info) = dpi.application
+                    && dns_info.query_type == Some(DnsQueryType::PTR)
+                {
+                    return false;
+                }
+                filter.as_ref().is_none_or(|f| f.matches(conn))
+            })
+            .cloned()
             .collect()
     }
 
@@ -1884,6 +1975,7 @@ impl App {
     /// Seed the UI snapshot directly. Tests only.
     #[cfg(test)]
     pub(crate) fn set_connections_snapshot_for_test(&self, snapshot: Vec<Connection>) {
+        self.snapshot_generation.fetch_add(1, Ordering::Release);
         *self.connections_snapshot.write().unwrap() = snapshot;
     }
 
@@ -1991,11 +2083,12 @@ impl App {
 fn update_connection(
     tracker: &ConnectionTracker,
     parsed: ParsedPacket,
+    now: SystemTime,
     stats: &AppStats,
     json_log_path: &Option<String>,
     dns_resolver: Option<&DnsResolver>,
 ) {
-    let outcome = tracker.ingest(&parsed);
+    let outcome = tracker.ingest_at(&parsed, now);
 
     // Fold TCP anomaly counts into the global statistics.
     if outcome.retransmits > 0 {
@@ -2038,5 +2131,92 @@ impl Drop for App {
         self.stop();
         // Give threads time to stop gracefully
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_log_file_tests {
+    use super::open_log_file;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// Per-test scratch directory under the system temp dir, removed on drop.
+    /// Avoids a `tempfile` dependency; uniqueness comes from the pid + the
+    /// caller-supplied tag (test names are unique).
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rustnet-log-test-{}-{}",
+                std::process::id(),
+                tag
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn creates_file_with_0600_permissions() {
+        let dir = ScratchDir::new("perms");
+        let path = dir.path("events.log");
+
+        let file = open_log_file(path.to_str().unwrap()).expect("fresh open should succeed");
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new log file must be created mode 0o600");
+    }
+
+    #[test]
+    fn appends_rather_than_truncates() {
+        let dir = ScratchDir::new("append");
+        let path = dir.path("events.log");
+        let p = path.to_str().unwrap();
+
+        writeln!(open_log_file(p).unwrap(), "line1").unwrap();
+        writeln!(open_log_file(p).unwrap(), "line2").unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("line1"), "first write must be preserved");
+        assert!(contents.contains("line2"), "second write must be appended");
+    }
+
+    #[test]
+    fn refuses_symlinked_path() {
+        let dir = ScratchDir::new("symlink");
+        let target = dir.path("real_target.log");
+        let link = dir.path("evil.log");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_log_file(link.to_str().unwrap())
+            .expect_err("O_NOFOLLOW must refuse a symlinked path");
+
+        // As the symlink's owner (the test process), `fs.protected_symlinks`
+        // does not intervene, so this is the raw O_NOFOLLOW rejection: ELOOP.
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got: {err}"
+        );
+
+        // The privileged write must not have been redirected through the link.
+        let target_contents = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            target_contents.is_empty(),
+            "symlink target must be untouched"
+        );
     }
 }
